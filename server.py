@@ -5,6 +5,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 import os
 import uuid
 import datetime
+import hashlib
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
@@ -12,19 +13,20 @@ OUTPUT_FOLDER = 'outputs'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-def generate_download_link(ip, serial, filename):
-    # Generate unique token
-    token = str(uuid.uuid4())
-    # Store mapping (in production use a database)
-    with open('tokens.txt', 'a') as f:
-        f.write(f"{token},{ip},{serial},{filename},{datetime.datetime.now()}\n")
-    return f"https://yourdomain.com/download?token={token}"
+def generate_file_id(ip_address, filename):
+    # Create unique file ID based on IP, filename, and timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
+    unique_str = f"{ip_address}-{filename}-{timestamp}"
+    return hashlib.md5(unique_str.encode()).hexdigest()[:12]
+
+def generate_serial_number():
+    # Generate an 8-character alphanumeric serial
+    return uuid.uuid4().hex[:8].upper()
 
 @app.route('/convert', methods=['POST'])
 def convert_csv_to_pdf():
-    # Get client IP and serial
-    client_ip = request.remote_addr
-    serial_number = request.form.get('serial')
+    # Get client IP address
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
     
     # Check if file exists
     if 'file' not in request.files:
@@ -34,13 +36,19 @@ def convert_csv_to_pdf():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     
-    # Save uploaded file
-    upload_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    # Generate automatic IDs
+    file_id = generate_file_id(client_ip, file.filename)
+    serial_number = generate_serial_number()
+    
+    # Save uploaded file with unique ID
+    file_ext = os.path.splitext(file.filename)[1]
+    upload_filename = f"{file_id}_{serial_number}{file_ext}"
+    upload_path = os.path.join(UPLOAD_FOLDER, upload_filename)
     file.save(upload_path)
     
     try:
         # Convert CSV to PDF
-        output_filename = f"{os.path.splitext(file.filename)[0]}.pdf"
+        output_filename = f"{file_id}_{serial_number}.pdf"
         output_path = os.path.join(OUTPUT_FOLDER, output_filename)
         
         df = pd.read_csv(upload_path)
@@ -56,31 +64,57 @@ def convert_csv_to_pdf():
         table.setStyle(style)
         doc.build([table])
         
-        # Generate download link
-        download_link = generate_download_link(client_ip, serial, output_filename)
+        # Create download token (expires in 1 hour)
+        expiration = datetime.datetime.now() + datetime.timedelta(hours=1)
+        token_data = {
+            'file_id': file_id,
+            'serial': serial_number,
+            'ip': client_ip,
+            'expires': expiration.timestamp(),
+            'filename': output_filename
+        }
+        
+        # In production, store this in a database
+        with open('tokens.txt', 'a') as f:
+            f.write(f"{token_data}\n")
         
         return jsonify({
             'status': 'success',
-            'download_link': download_link,
+            'file_id': file_id,
+            'serial_number': serial_number,
+            'download_link': f"/download/{file_id}/{serial_number}",
             'filename': output_filename
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/download', methods=['GET'])
-def download_file():
-    token = request.args.get('token')
+@app.route('/download/<file_id>/<serial_number>', methods=['GET'])
+def download_file(file_id, serial_number):
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
     
-    # Verify token (in production use a database)
+    # Verify the download request
+    valid = False
+    output_filename = None
+    
+    # In production, query a database instead
     with open('tokens.txt', 'r') as f:
         for line in f:
-            stored_token, ip, serial, filename, timestamp = line.strip().split(',')
-            if stored_token == token:
-                # Verify IP matches (optional)
-                if ip == request.remote_addr:
-                    filepath = os.path.join(OUTPUT_FOLDER, filename)
-                    if os.path.exists(filepath):
-                        return send_file(filepath, as_attachment=True)
+            try:
+                token_data = eval(line.strip())
+                if (token_data['file_id'] == file_id and 
+                    token_data['serial'] == serial_number and
+                    token_data['ip'] == client_ip and
+                    datetime.datetime.now().timestamp() < token_data['expires']):
+                    valid = True
+                    output_filename = token_data['filename']
+                    break
+            except:
+                continue
+    
+    if valid and output_filename:
+        filepath = os.path.join(OUTPUT_FOLDER, output_filename)
+        if os.path.exists(filepath):
+            return send_file(filepath, as_attachment=True)
     
     return "Invalid or expired download link", 404
 
