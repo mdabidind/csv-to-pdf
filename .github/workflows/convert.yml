@@ -1,0 +1,44 @@
+name: CSV to PDF Conversion
+
+on:
+  repository_dispatch:
+    types: [convert_request]
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+      
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.8'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas reportlab
+        
+    - name: Get the CSV file
+      run: |
+        curl -L "${{ github.event.client_payload.csv_url }}" -o inputs/${{ github.event.client_payload.doc_id }}.csv
+        
+    - name: Convert CSV to PDF
+      run: |
+        python convert.py ${{ github.event.client_payload.doc_id }}
+        
+    - name: Upload PDF
+      run: |
+        curl -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d '{"doc_id": "${{ github.event.client_payload.doc_id }}", "status": "completed"}' \
+          https://your-hostinger-domain.com/update-status
+          
+    - name: Upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: pdf-output
+        path: outputs/
